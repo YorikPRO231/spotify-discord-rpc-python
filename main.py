@@ -94,7 +94,7 @@ class AutoUpdater:
             return None
 
     def check_for_updates(self):
-        if not self.repo_url or self.repo_url == "https://github.com/YorikPRO231/spotify-discord-rpc-python":
+        if not self.repo_url:
             logger.info ("Update check skipped - repository URL not configured")
             return False
 
@@ -437,7 +437,7 @@ def main():
     if not settings:
         sys.exit (1)
 
-    updater = AutoUpdater ("")
+    updater = AutoUpdater ("https://github.com/YorikPRO231/spotify-discord-rpc-python")
     if updater.check_for_updates ():
         sys.exit (0)
 
