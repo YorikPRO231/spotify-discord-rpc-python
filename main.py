@@ -1,3 +1,5 @@
+import shutil
+
 import requests
 import json
 import time
@@ -87,16 +89,25 @@ class AutoUpdater:
         self.current_version = self.get_current_version ()
         self.update_in_progress = False
         self.last_check_file = Path (sys.executable).parent / 'last_update_check' if self.is_exe else None
+        self.max_retries = 3
+        self.retry_delay = 5
+        self.update_check_interval = 86400  # 24 часа в секундах
+        self.user_agent = "SpotifyDiscordRPC/1.0"
 
     def get_current_version(self):
+        """Получает текущую версию приложения"""
         try:
             if self.is_exe:
                 version_file = Path (sys.executable).parent / 'version.txt'
                 if version_file.exists ():
                     with open (version_file, 'r') as f:
-                        return f.read ().strip ()
+                        version = f.read ().strip ()
+                        if version:  # Проверяем, что файл не пустой
+                            return version
+                # Возвращаем версию по умолчанию, если файл не существует или пуст
                 return "1.1.0"
             else:
+                # Для исходного кода используем хеш файла
                 with open (__file__, 'rb') as f:
                     return hashlib.md5 (f.read ()).hexdigest ()
         except Exception as e:
@@ -104,62 +115,116 @@ class AutoUpdater:
             return "unknown"
 
     def should_check_for_updates(self):
+        """Определяет, нужно ли проверять обновления"""
         if not self.is_exe:
-            return True
+            return True  # Для исходного кода проверяем всегда
 
         if not self.last_check_file.exists ():
             return True
 
         try:
             last_check = float (self.last_check_file.read_text ())
-            return (time.time () - last_check) > 86400
-        except:
+            return (time.time () - last_check) > self.update_check_interval
+        except Exception as e:
+            logger.error (f"Error reading last check time: {e}")
             return True
 
-    def check_for_updates(self):
+    def check_for_updates(self, force=False):
+        """Основной метод проверки обновлений"""
         if not self.repo_url or self.update_in_progress:
             return False
 
         try:
-            if not self.should_check_for_updates ():
+            if not force and not self.should_check_for_updates ():
                 return False
 
+            logger.info ("Checking for updates...")
+
             if self.is_exe:
-                releases_api = f"https://api.github.com/repos/{self.repo_url.split ('github.com/')[1]}/releases/latest"
-                response = requests.get (releases_api, timeout=10)
-                response.raise_for_status ()
-
-                release_data = response.json ()
-                latest_version = release_data['tag_name']
-
-                if latest_version != self.current_version:
-                    logger.info (f"New version available: {latest_version}")
-                    return self.download_exe_update (release_data)
+                return self.check_exe_updates ()
             else:
-                raw_url = f"https://raw.githubusercontent.com/{self.repo_url.split ('github.com/')[1]}/main/main.py"
-                response = requests.get (raw_url, timeout=10)
-                response.raise_for_status ()
+                return self.check_source_updates ()
 
-                remote_hash = hashlib.md5 (response.content).hexdigest ()
-                if remote_hash != self.current_version:
-                    logger.info ("Source code update available")
-                    return self.update_source (response.content)
-
-            if self.is_exe and self.last_check_file:
-                with open (self.last_check_file, 'w') as f:
-                    f.write (str (time.time ()))
-
-            return False
         except Exception as e:
             logger.error (f"Update check failed: {e}")
             return False
+        finally:
+            if self.is_exe and self.last_check_file:
+                self.update_last_check_time ()
+
+    def check_exe_updates(self):
+        """Проверка обновлений для исполняемого файла"""
+        try:
+            repo_path = self.repo_url.split ('github.com/')[1]
+            releases_api = f"https://api.github.com/repos/{repo_path}/releases/latest"
+
+            response = self.make_http_request (releases_api)
+            if not response:
+                return False
+
+            release_data = response.json ()
+            latest_version = release_data.get ('tag_name')
+
+            if not latest_version:
+                logger.error ("No version tag found in release data")
+                return False
+
+            if latest_version != self.current_version:
+                logger.info (f"New version available: {latest_version} (current: {self.current_version})")
+                return self.download_exe_update (release_data)
+
+            logger.info ("No updates available")
+            return False
+
+        except Exception as e:
+            logger.error (f"EXE update check failed: {e}")
+            return False
+
+    def check_source_updates(self):
+        """Проверка обновлений для исходного кода"""
+        try:
+            repo_path = self.repo_url.split ('github.com/')[1]
+            raw_url = f"https://raw.githubusercontent.com/{repo_path}/main/main.py"
+
+            response = self.make_http_request (raw_url)
+            if not response:
+                return False
+
+            remote_hash = hashlib.md5 (response.content).hexdigest ()
+            if remote_hash != self.current_version:
+                logger.info ("Source code update available")
+                return self.update_source (response.content)
+
+            logger.info ("Source code is up to date")
+            return False
+
+        except Exception as e:
+            logger.error (f"Source update check failed: {e}")
+            return False
+
+    def make_http_request(self, url):
+        """Выполняет HTTP-запрос с повторными попытками"""
+        for attempt in range (self.max_retries):
+            try:
+                headers = {'User-Agent': self.user_agent}
+                response = requests.get (url, headers=headers, timeout=10)
+                response.raise_for_status ()
+                return response
+            except requests.exceptions.RequestException as e:
+                if attempt < self.max_retries - 1:
+                    logger.warning (f"Request failed (attempt {attempt + 1}/{self.max_retries}): {e}")
+                    time.sleep (self.retry_delay)
+                else:
+                    raise
+        return None
 
     def download_exe_update(self, release_data):
+        """Загружает и устанавливает обновление для исполняемого файла"""
         self.update_in_progress = True
         try:
             exe_asset = next (
                 (asset for asset in release_data['assets']
-                 if asset['name'].lower () == 'spotifydiscordrpc.exe'),
+                 if asset['name'].lower ().endswith ('.exe') and 'spotifydiscordrpc' in asset['name'].lower ()),
                 None
             )
 
@@ -171,42 +236,38 @@ class AutoUpdater:
             temp_exe = Path (sys.executable).parent / 'SpotifyDiscordRPC_new.exe'
 
             logger.info (f"Downloading update from {download_url}")
-            response = requests.get (download_url, stream=True, timeout=30)
-            response.raise_for_status ()
-
-            if temp_exe.exists ():
-                temp_exe.unlink ()
-
-            with open (temp_exe, 'wb') as f:
-                for chunk in response.iter_content (chunk_size=8192):
-                    f.write (chunk)
-
-            if not temp_exe.exists ():
-                logger.error ("Downloaded file not found")
+            response = self.make_http_request (download_url)
+            if not response:
                 return False
 
-            bat_content = f"""
-            @echo off
-            timeout /t 5 /nobreak >nul
-            taskkill /F /IM "{Path (sys.executable).name}" >nul 2>&1
-            :loop
-            del "{sys.executable}" >nul 2>&1
-            if exist "{sys.executable}" (
-                timeout /t 1 /nobreak >nul
-                goto loop
-            )
-            rename "{temp_exe}" "{Path (sys.executable).name}"
-            start "" "{Path (sys.executable).name}"
-            del "%~f0"
-            """
+            temp_download = temp_exe.with_name (f"{temp_exe.stem}_{int (time.time ())}{temp_exe.suffix}")
 
-            bat_path = Path (sys.executable).parent / 'update.bat'
-            with open (bat_path, 'w') as f:
-                f.write (bat_content)
+            try:
+                with open (temp_download, 'wb') as f:
+                    for chunk in response.iter_content (chunk_size=8192):
+                        f.write (chunk)
 
-            logger.info ("Launching updater script")
-            os.startfile (bat_path)
-            return True
+                if not temp_download.exists ():
+                    logger.error ("Downloaded file not found")
+                    return False
+
+                # Проверяем, что файл не пустой
+                if temp_download.stat ().st_size == 0:
+                    logger.error ("Downloaded file is empty")
+                    temp_download.unlink ()
+                    return False
+
+                # Переименовываем во временный файл
+                if temp_exe.exists ():
+                    temp_exe.unlink ()
+                temp_download.rename (temp_exe)
+
+                return self.create_updater_script (temp_exe)
+
+            except Exception as e:
+                if temp_download.exists ():
+                    temp_download.unlink ()
+                raise
 
         except Exception as e:
             logger.error (f"Update download failed: {e}")
@@ -214,21 +275,89 @@ class AutoUpdater:
         finally:
             sys.exit (0)
 
+    def create_updater_script(self, temp_exe):
+        """Создает скрипт для обновления"""
+        try:
+            bat_content = f"""
+            @echo off
+            chcp 65001 >nul
+            echo Updating Spotify Discord RPC...
+            timeout /t 3 /nobreak >nul
+
+            :kill_process
+            taskkill /F /IM "{Path (sys.executable).name}" >nul 2>&1
+            if %errorlevel% neq 0 goto check_process
+
+            :check_process
+            tasklist | find "{Path (sys.executable).stem}" >nul
+            if %errorlevel% eq 0 (
+                timeout /t 1 /nobreak >nul
+                goto kill_process
+            )
+
+            :replace_file
+            del "{sys.executable}" >nul 2>&1
+            if exist "{sys.executable}" (
+                timeout /t 1 /nobreak >nul
+                goto replace_file
+            )
+
+            rename "{temp_exe}" "{Path (sys.executable).name}"
+
+            :start_app
+            start "" "{Path (sys.executable).name}"
+
+            :cleanup
+            del "%~f0"
+            exit
+            """
+
+            bat_path = Path (sys.executable).parent / 'update.bat'
+            with open (bat_path, 'w', encoding='utf-8') as f:
+                f.write (bat_content)
+
+            logger.info ("Launching updater script")
+            os.startfile (bat_path)
+            return True
+
+        except Exception as e:
+            logger.error (f"Failed to create updater script: {e}")
+            return False
+
     def update_source(self, new_content):
+        """Обновляет исходный код"""
         try:
             backup_file = f"{__file__}.bak"
-            with open (__file__, 'rb') as f:
-                with open (backup_file, 'wb') as backup:
-                    backup.write (f.read ())
+            if os.path.exists (backup_file):
+                os.remove (backup_file)
 
+            shutil.copy2 (__file__, backup_file)
+
+            # Записываем новый контент
             with open (__file__, 'wb') as f:
                 f.write (new_content)
 
-            logger.info ("Source updated. Please restart.")
+            logger.info ("Source updated successfully. Please restart the application.")
             return True
+
         except Exception as e:
             logger.error (f"Source update failed: {e}")
+            # Пытаемся восстановить из резервной копии
+            if os.path.exists (backup_file):
+                try:
+                    shutil.copy2 (backup_file, __file__)
+                    logger.info ("Restored from backup after failed update")
+                except Exception as restore_error:
+                    logger.error (f"Failed to restore from backup: {restore_error}")
             return False
+
+    def update_last_check_time(self):
+        """Обновляет время последней проверки обновлений"""
+        try:
+            with open (self.last_check_file, 'w') as f:
+                f.write (str (time.time ()))
+        except Exception as e:
+            logger.error (f"Failed to update last check time: {e}")
 
 
 class CallbackHandler (BaseHTTPRequestHandler):
