@@ -12,9 +12,7 @@ from pathlib import Path
 import base64
 import sys
 import hashlib
-import datetime
 
-# Настройка логгирования
 logging.basicConfig (
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -87,33 +85,46 @@ class AutoUpdater:
         self.repo_url = repo_url
         self.is_exe = getattr (sys, 'frozen', False)
         self.current_version = self.get_current_version ()
+        self.update_in_progress = False
+        self.last_check_file = Path (sys.executable).parent / 'last_update_check' if self.is_exe else None
 
     def get_current_version(self):
-        """Get current version differently for EXE and source"""
         try:
             if self.is_exe:
-                # For EXE - use version.txt or executable hash
                 version_file = Path (sys.executable).parent / 'version.txt'
                 if version_file.exists ():
                     with open (version_file, 'r') as f:
                         return f.read ().strip ()
-                return "1.0.0"  # Fallback version
+                return "1.1.0"
             else:
-                # For source - use file hash
                 with open (__file__, 'rb') as f:
                     return hashlib.md5 (f.read ()).hexdigest ()
         except Exception as e:
             logger.error (f"Version detection error: {e}")
             return "unknown"
 
+    def should_check_for_updates(self):
+        if not self.is_exe:
+            return True
+
+        if not self.last_check_file.exists ():
+            return True
+
+        try:
+            last_check = float (self.last_check_file.read_text ())
+            return (time.time () - last_check) > 86400
+        except:
+            return True
+
     def check_for_updates(self):
-        if not self.repo_url:
-            logger.info ("Update check disabled - no repo URL")
+        if not self.repo_url or self.update_in_progress:
             return False
 
         try:
+            if not self.should_check_for_updates ():
+                return False
+
             if self.is_exe:
-                # For EXE: Check GitHub releases
                 releases_api = f"https://api.github.com/repos/{self.repo_url.split ('github.com/')[1]}/releases/latest"
                 response = requests.get (releases_api, timeout=10)
                 response.raise_for_status ()
@@ -124,9 +135,7 @@ class AutoUpdater:
                 if latest_version != self.current_version:
                     logger.info (f"New version available: {latest_version}")
                     return self.download_exe_update (release_data)
-                return False
             else:
-                # For source: Check file hash
                 raw_url = f"https://raw.githubusercontent.com/{self.repo_url.split ('github.com/')[1]}/main/main.py"
                 response = requests.get (raw_url, timeout=10)
                 response.raise_for_status ()
@@ -135,24 +144,27 @@ class AutoUpdater:
                 if remote_hash != self.current_version:
                     logger.info ("Source code update available")
                     return self.update_source (response.content)
-                return False
 
+            if self.is_exe and self.last_check_file:
+                with open (self.last_check_file, 'w') as f:
+                    f.write (str (time.time ()))
+
+            return False
         except Exception as e:
             logger.error (f"Update check failed: {e}")
             return False
 
     def download_exe_update(self, release_data):
-        """Download and install EXE update"""
+        self.update_in_progress = True
         try:
-            # Find .exe asset
             exe_asset = next (
                 (asset for asset in release_data['assets']
-                 if asset['name'].lower ().endswith ('.exe')),
+                 if asset['name'].lower () == 'spotifydiscordrpc.exe'),
                 None
             )
 
             if not exe_asset:
-                logger.error ("No EXE asset found in release")
+                logger.error ("Correct EXE asset not found in release")
                 return False
 
             download_url = exe_asset['browser_download_url']
@@ -162,15 +174,27 @@ class AutoUpdater:
             response = requests.get (download_url, stream=True, timeout=30)
             response.raise_for_status ()
 
+            if temp_exe.exists ():
+                temp_exe.unlink ()
+
             with open (temp_exe, 'wb') as f:
                 for chunk in response.iter_content (chunk_size=8192):
                     f.write (chunk)
 
-            # Create update script
+            if not temp_exe.exists ():
+                logger.error ("Downloaded file not found")
+                return False
+
             bat_content = f"""
             @echo off
-            timeout /t 3 /nobreak >nul
-            del "{sys.executable}"
+            timeout /t 5 /nobreak >nul
+            taskkill /F /IM "{Path (sys.executable).name}" >nul 2>&1
+            :loop
+            del "{sys.executable}" >nul 2>&1
+            if exist "{sys.executable}" (
+                timeout /t 1 /nobreak >nul
+                goto loop
+            )
             rename "{temp_exe}" "{Path (sys.executable).name}"
             start "" "{Path (sys.executable).name}"
             del "%~f0"
@@ -180,16 +204,17 @@ class AutoUpdater:
             with open (bat_path, 'w') as f:
                 f.write (bat_content)
 
+            logger.info ("Launching updater script")
             os.startfile (bat_path)
-            sys.exit (0)
             return True
 
         except Exception as e:
             logger.error (f"Update download failed: {e}")
             return False
+        finally:
+            sys.exit (0)
 
     def update_source(self, new_content):
-        """Update source code version"""
         try:
             backup_file = f"{__file__}.bak"
             with open (__file__, 'rb') as f:
