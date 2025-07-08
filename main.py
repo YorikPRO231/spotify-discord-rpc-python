@@ -87,8 +87,12 @@ class AutoUpdater:
 
     def get_current_hash(self):
         try:
-            with open (__file__, 'rb') as f:
-                return hashlib.md5 (f.read ()).hexdigest ()
+            if getattr (sys, 'frozen', False):
+                logger.info ("Running as EXE, using alternative version check")
+                return None
+            else:
+                with open (__file__, 'rb') as f:
+                    return hashlib.md5 (f.read ()).hexdigest ()
         except Exception as e:
             logger.error (f"Error getting current version hash: {e}")
             return None
@@ -98,15 +102,27 @@ class AutoUpdater:
             logger.info ("Update check skipped - repository URL not configured")
             return False
 
+        if getattr (sys, 'frozen', False):
+            logger.info ("Update check skipped for EXE version")
+            return False
+
         try:
-            response = requests.get (f"{self.repo_url}/raw/main/{os.path.basename (__file__)}")
+            response = requests.get (f"{self.repo_url}/raw/main/{os.path.basename (__file__)}?t={time.time ()}",
+                                     timeout=10)
             response.raise_for_status ()
 
             remote_hash = hashlib.md5 (response.content).hexdigest ()
-            if remote_hash != self.current_version:
-                logger.info ("New version detected. Updating...")
-                self.update_application (response.content)
-                return True
+            current_hash = self.get_current_hash ()
+
+            if not current_hash:
+                logger.warning ("Could not determine current version hash")
+                return False
+
+            if remote_hash != current_hash:
+                logger.info (f"Update available (current: {current_hash[:6]}..., remote: {remote_hash[:6]}...)")
+                return self.update_application (response.content)
+
+            logger.debug ("No updates available")
             return False
         except Exception as e:
             logger.error (f"Update check failed: {e}")
